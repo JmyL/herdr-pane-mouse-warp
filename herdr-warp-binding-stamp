@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Stamp Sway keyboard focus bindings for Kitty window-focus warp.
+
+Hover and click-to-focus do not emit a binding event, so
+herdr-warp-on-window-focus can skip those. Notification clicks warp via
+herdr-warp-on-focus after herdr agent focus, not this window-focus path.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SWAYMSG = os.environ.get("HERDR_WARP_SWAYMSG") or "swaymsg"
+_CRITERIA = re.compile(r"^\[.*?\]\s*")
+FOCUS_VERBS = frozenset({"focus", "workspace", "scratchpad"})
+
+
+def runtime_dir() -> Path:
+    if os.environ.get("HERDR_WARP_DIR"):
+        return Path(os.environ["HERDR_WARP_DIR"])
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        return Path(xdg) / "herdr-warp"
+    return Path(f"/run/user/{os.getuid()}") / "herdr-warp"
+
+
+def lock_path() -> Path:
+    if os.environ.get("HERDR_WARP_BINDING_LOCK"):
+        return Path(os.environ["HERDR_WARP_BINDING_LOCK"])
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    root = Path(xdg) if xdg else Path(f"/run/user/{os.getuid()}")
+    return root / "herdr-warp-binding-stamp.lock"
+
+
+def enabled() -> bool:
+    return os.environ.get("HERDR_WARP_ON_FOCUS", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def command_changes_focus(command: str) -> bool:
+    for raw in (command or "").split(";"):
+        part = raw.strip()
+        while part.startswith("["):
+            stripped = _CRITERIA.sub("", part, count=1)
+            if stripped == part:
+                break
+            part = stripped.strip()
+        if not part:
+            continue
+        verb = part.split(None, 1)[0].lower()
+        if verb in FOCUS_VERBS:
+            return True
+    return False
+
+
+def should_stamp(event: object) -> bool:
+    if not isinstance(event, dict):
+        return False
+    if event.get("change") not in (None, "run"):
+        return False
+    binding = event.get("binding")
+    if not isinstance(binding, dict):
+        return False
+    input_type = str(binding.get("input_type") or "keyboard").lower()
+    if input_type != "keyboard":
+        return False
+    return command_changes_focus(str(binding.get("command") or ""))
+
+
+def write_stamp(warp_dir: Path, now_ms: int | None = None) -> None:
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    warp_dir.mkdir(parents=True, exist_ok=True)
+    (warp_dir / "last-binding").write_text(f"{now_ms}\n", encoding="utf-8")
+
+
+def handle_line(line: str, warp_dir: Path) -> bool:
+    text = line.strip()
+    if not text:
+        return False
+    try:
+        event = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    if not should_stamp(event):
+        return False
+    write_stamp(warp_dir)
+    return True
+
+
+def subscribe_argv() -> list[str]:
+    args = [SWAYMSG, "-t", "subscribe", "-m", '["binding"]']
+    if shutil.which(args[0]):
+        return args
+    if Path("/run/.containerenv").is_file() and shutil.which("flatpak-spawn"):
+        return ["flatpak-spawn", "--host", *args]
+    return args
+
+
+def acquire_lock() -> int | None:
+    path = lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def main(argv: list[str] | None = None) -> int:
+    del argv
+    if not enabled():
+        return 0
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        return 0
+    try:
+        proc = subprocess.Popen(
+            subscribe_argv(),
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        assert proc.stdout is not None
+        warp_dir = runtime_dir()
+        for line in proc.stdout:
+            handle_line(line, warp_dir)
+        return proc.wait()
+    finally:
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

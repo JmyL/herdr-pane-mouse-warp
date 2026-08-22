@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+# Warp the Sway pointer into the focused Herdr pane (right edge, vertical center)
+# so the mouse wheel scrolls that pane after keyboard focus moves.
+set -euo pipefail
+
+case "${HERDR_WARP_ON_FOCUS:-1}" in
+0 | false | no | off | FALSE | NO | OFF)
+  exit 0
+  ;;
+esac
+
+debug() {
+  case "${HERDR_WARP_ON_FOCUS_DEBUG:-0}" in
+  1 | true | yes | on | TRUE | YES | ON)
+    printf 'herdr-warp-on-focus: %s\n' "$*" >&2
+    ;;
+  esac
+}
+
+# Kitty's inherited PATH often omits ~/.local/bin, where herdr lives.
+user_bin="${HERDR_WARP_USER_BIN:-${HOME}/.local/bin}"
+if [[ -d "$user_bin" ]]; then
+  case ":${PATH}:" in
+  *":${user_bin}:"*) ;;
+  *) PATH="${user_bin}:${PATH}" ;;
+  esac
+fi
+herdr_bin="${HERDR_BIN:-herdr}"
+
+# Run compositor/terminal tools on the host when this script is inside a toolbox.
+run_host() {
+  if command -v "$1" >/dev/null 2>&1; then
+    "$@"
+  elif [[ -f /run/.containerenv ]] && command -v flatpak-spawn >/dev/null 2>&1; then
+    flatpak-spawn --host "$@"
+  else
+    return 127
+  fi
+}
+
+# `cursor set` often moves the compositor pointer without a motion event, so
+# Herdr keeps scrolling the old pane. Set one pixel left, then `move 1 0` so
+# the client sees motion and we still land on (x, y). Sway treats 0 as "leave
+# this axis unchanged", so skip the left step when x-1 would be 0.
+warp_seat_cursor() {
+  local target_x="$1" target_y="$2" set_x
+  set_x=$((target_x - 1))
+  if ((set_x >= 1)); then
+    if ! run_host swaymsg "seat seat0 cursor set ${set_x} ${target_y}" >/dev/null 2>&1; then
+      return 1
+    fi
+    run_host swaymsg "seat seat0 cursor move 1 0" >/dev/null 2>&1 || true
+    return 0
+  fi
+  if ! run_host swaymsg "seat seat0 cursor set ${target_x} ${target_y}" >/dev/null 2>&1; then
+    return 1
+  fi
+  run_host swaymsg "seat seat0 cursor move 0 1" >/dev/null 2>&1 || true
+}
+
+if [[ "${1:-}" == "--cursor-only" ]]; then
+  warp_seat_cursor "${2:-}" "${3:-}" || exit 0
+  exit 0
+fi
+
+host_socket_exists() {
+  local path="$1"
+  if [[ -S "$path" ]]; then
+    return 0
+  fi
+  if [[ -f /run/.containerenv ]] && command -v flatpak-spawn >/dev/null 2>&1; then
+    flatpak-spawn --host test -S "$path"
+  else
+    return 1
+  fi
+}
+
+# Resolve the focused Kitty's listen socket. Herdr server may keep a stale
+# KITTY_LISTEN_ON after Kitty relaunch/reattach, and with multiple Kitties the
+# env socket can point at a different live instance — always prefer focused pid.
+kitty_listen_to() {
+  local listen path pid
+  pid=$(TREE_JSON="$tree_json" python3 - <<'PY'
+import json
+import os
+
+def walk(node):
+  if node.get("focused"):
+    return node
+  for child in node.get("nodes", []) + node.get("floating_nodes", []):
+    found = walk(child)
+    if found is not None:
+      return found
+  return None
+
+try:
+  tree = json.loads(os.environ.get("TREE_JSON", ""))
+except Exception:
+  raise SystemExit(0)
+focused = walk(tree)
+if not focused:
+  raise SystemExit(0)
+if (focused.get("app_id") or "").lower() != "kitty":
+  raise SystemExit(0)
+pid = focused.get("pid")
+if pid is None:
+  raise SystemExit(0)
+print(int(pid))
+PY
+  ) || true
+  if [[ -n "${pid:-}" ]] && host_socket_exists "/tmp/kitty-${pid}"; then
+    printf 'unix:/tmp/kitty-%s\n' "$pid"
+    return 0
+  fi
+
+  listen="${KITTY_LISTEN_ON-}"
+  if [[ -n "$listen" ]]; then
+    path="${listen#unix:}"
+    if host_socket_exists "$path"; then
+      debug "focused kitty socket missing; falling back to KITTY_LISTEN_ON"
+      printf '%s\n' "$listen"
+      return 0
+    fi
+    debug "stale KITTY_LISTEN_ON ($listen)"
+  fi
+
+  return 1
+}
+
+kitty_ls_json() {
+  local to
+  to=$(kitty_listen_to) || return 1
+  debug "kitty --to ${to}"
+  # Drop inherited KITTY_LISTEN_ON so a stale value cannot override --to.
+  run_host env -u KITTY_LISTEN_ON kitty @ --to "$to" ls
+}
+
+if ! command -v "$herdr_bin" >/dev/null 2>&1; then
+  debug "herdr unavailable"
+  exit 0
+fi
+
+layout_json=$("$herdr_bin" pane layout --current 2>/dev/null) || {
+  debug "herdr pane layout failed"
+  exit 0
+}
+
+tree_json=$(run_host swaymsg -t get_tree 2>/dev/null) || {
+  debug "swaymsg get_tree failed"
+  exit 0
+}
+
+outputs_json=$(run_host swaymsg -t get_outputs 2>/dev/null || true)
+
+kitty_json=$(kitty_ls_json 2>/dev/null || true)
+
+kitty_conf="${KITTY_CONFIG_DIRECTORY:-${XDG_CONFIG_HOME:-$HOME/.config}/kitty}/kitty.conf"
+
+read -r target_x target_y status win_w win_h kitty_pid < <(LAYOUT_JSON="$layout_json" TREE_JSON="$tree_json" OUTPUTS_JSON="$outputs_json" KITTY_JSON="$kitty_json" KITTY_CONF="$kitty_conf" python3 - <<'PY'
+import json
+import os
+
+def die(msg: str) -> None:
+  print(f"0 0 {msg} 0 0 0", flush=True)
+  raise SystemExit(0)
+
+layout_raw = os.environ.get("LAYOUT_JSON", "")
+tree_raw = os.environ.get("TREE_JSON", "")
+outputs_raw = os.environ.get("OUTPUTS_JSON", "")
+kitty_raw = os.environ.get("KITTY_JSON", "")
+kitty_conf = os.environ.get("KITTY_CONF", "")
+
+try:
+  layout = json.loads(layout_raw)["result"]["layout"]
+except Exception:
+  die("bad-layout")
+
+try:
+  tree = json.loads(tree_raw)
+except Exception:
+  die("bad-tree")
+
+panes = layout.get("panes") or []
+pane = next((p for p in panes if p.get("focused")), None)
+if pane is None:
+  focused_id = layout.get("focused_pane_id")
+  pane = next((p for p in panes if p.get("pane_id") == focused_id), None)
+if not pane:
+  die("no-pane")
+
+rect = pane.get("rect") or {}
+try:
+  px = int(rect["x"])
+  py = int(rect["y"])
+  pw = int(rect["width"])
+  ph = int(rect["height"])
+except (KeyError, TypeError, ValueError):
+  die("bad-pane-rect")
+if pw <= 0 or ph <= 0:
+  die("empty-pane")
+
+def walk(node):
+  if node.get("focused"):
+    return node
+  for child in node.get("nodes", []) + node.get("floating_nodes", []):
+    found = walk(child)
+    if found is not None:
+      return found
+  return None
+
+focused = walk(tree)
+if focused is None:
+  die("no-focused-window")
+
+app_id = (focused.get("app_id") or "").lower()
+if app_id != "kitty":
+  die(f"not-kitty:{app_id or 'unknown'}")
+
+win = focused.get("rect") or {}
+try:
+  wx = int(win["x"])
+  wy = int(win["y"])
+  ww = int(win["width"])
+  wh = int(win["height"])
+except (KeyError, TypeError, ValueError):
+  die("bad-window-rect")
+if ww <= 0 or wh <= 0:
+  die("empty-window")
+
+cols = lines = None
+if kitty_raw:
+  try:
+    data = json.loads(kitty_raw)
+  except Exception:
+    data = None
+  windows = []
+  if isinstance(data, list):
+    for ow in data:
+      for tab in ow.get("tabs", []) or []:
+        windows.extend(tab.get("windows", []) or [])
+  for candidate in windows:
+    if candidate.get("is_focused"):
+      cols = candidate.get("columns")
+      lines = candidate.get("lines")
+      break
+  if cols is None and windows:
+    for candidate in windows:
+      title = (candidate.get("title") or "").lower()
+      if "herdr" in title:
+        cols = candidate.get("columns")
+        lines = candidate.get("lines")
+        break
+    if cols is None:
+      cols = windows[0].get("columns")
+      lines = windows[0].get("lines")
+
+try:
+  cols = int(cols)
+  lines = int(lines)
+except (TypeError, ValueError):
+  die("no-cell-metrics")
+if cols <= 0 or lines <= 0:
+  die("bad-cell-metrics")
+
+def padding_pts(path: str) -> tuple[float, float, float, float]:
+  # top right bottom left, default matches kitty's window_padding_width 0
+  values = [0.0, 0.0, 0.0, 0.0]
+  try:
+    with open(path, encoding="utf-8") as fh:
+      for line in fh:
+        line = line.split("#", 1)[0].strip()
+        if not line.startswith("window_padding_width"):
+          continue
+        parts = line.split()[1:]
+        nums = [float(p) for p in parts]
+        if len(nums) == 1:
+          values = [nums[0]] * 4
+        elif len(nums) == 2:
+          values = [nums[0], nums[1], nums[0], nums[1]]
+        elif len(nums) == 3:
+          values = [nums[0], nums[1], nums[2], nums[1]]
+        elif len(nums) >= 4:
+          values = nums[:4]
+  except OSError:
+    pass
+  return values[0], values[1], values[2], values[3]
+
+scale = 1.0
+if outputs_raw:
+  try:
+    outputs = json.loads(outputs_raw)
+  except Exception:
+    outputs = []
+  cx = wx + ww / 2.0
+  cy = wy + wh / 2.0
+  for output in outputs:
+    if not output.get("active"):
+      continue
+    orect = output.get("rect") or {}
+    try:
+      ox, oy = int(orect["x"]), int(orect["y"])
+      ow, oh = int(orect["width"]), int(orect["height"])
+    except (KeyError, TypeError, ValueError):
+      continue
+    if ox <= cx < ox + ow and oy <= cy < oy + oh:
+      try:
+        scale = float(output.get("scale") or 1.0)
+      except (TypeError, ValueError):
+        scale = 1.0
+      break
+
+pad_top, pad_right, pad_bottom, pad_left = padding_pts(kitty_conf)
+pad_x0 = pad_left * scale
+pad_x1 = pad_right * scale
+pad_y0 = pad_top * scale
+pad_y1 = pad_bottom * scale
+
+inner_w = ww - pad_x0 - pad_x1
+inner_h = wh - pad_y0 - pad_y1
+if inner_w <= 0 or inner_h <= 0:
+  die("bad-inner")
+
+# Kitty cells sit inside window_padding; leftover space is extra padding
+# (placement_strategy center by default). Approximate that by centering the
+# cell grid in the inner area using integer cell pitches.
+cell_w = inner_w / cols
+cell_h = inner_h / lines
+origin_x = wx + pad_x0
+origin_y = wy + pad_y0
+
+# One cell inset from the pane's right edge keeps the pointer inside the
+# pane (and away from scrollbar/split chrome) despite rounding.
+# Extra 10px left nudge clears Kitty scrollbar/chrome more reliably.
+inset_cols = 1.5 if pw > 1 else 0.5
+inset_rows = ph / 2.0
+x = int(origin_x + (px + pw - inset_cols) * cell_w) - 10
+y = int(origin_y + (py + inset_rows) * cell_h)
+
+# Clamp to the pane's inner pixel box so we never sit on/over the border.
+pane_left = origin_x + px * cell_w
+pane_right = origin_x + (px + pw) * cell_w
+pane_top = origin_y + py * cell_h
+pane_bottom = origin_y + (py + ph) * cell_h
+margin = max(cell_w * 0.25, 1.0)
+x = int(min(max(x, pane_left + margin), pane_right - margin))
+y = int(min(max(y, pane_top + margin), pane_bottom - margin))
+try:
+  kitty_pid = int(focused.get("pid") or 0)
+except (TypeError, ValueError):
+  kitty_pid = 0
+print(f"{x} {y} ok {ww} {wh} {kitty_pid}")
+PY
+) || {
+  debug "coordinate calc failed"
+  exit 0
+}
+
+if [[ "$status" != "ok" ]]; then
+  debug "skip ($status)"
+  exit 0
+fi
+
+if [[ -n "${HERDR_WARP_TOKEN:-}" && -n "${HERDR_WARP_TOKEN_FILE:-}" ]]; then
+  token_now=$(cat "${HERDR_WARP_TOKEN_FILE}" 2>/dev/null || true)
+  if [[ "$token_now" != "$HERDR_WARP_TOKEN" ]]; then
+    debug "stale token; skip cursor set"
+    exit 0
+  fi
+fi
+
+if ! warp_seat_cursor "$target_x" "$target_y"; then
+  debug "cursor set failed (${target_x},${target_y})"
+  exit 0
+fi
+
+warp_dir="${HERDR_WARP_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/herdr-warp}"
+mkdir -p "$warp_dir"
+if [[ -n "${kitty_pid:-}" && "$kitty_pid" != "0" ]]; then
+  printf '%s %s\n%s %s\n' "$target_x" "$target_y" "${win_w:-0}" "${win_h:-0}" >"${warp_dir}/pane-${kitty_pid}"
+fi
+python3 -c 'import time; print(int(time.time() * 1000))' >"${warp_dir}/last-pane-warp"
+# Invalidate an in-flight window-focus compute so it cannot stomp this pane warp.
+if [[ -z "${HERDR_WARP_TOKEN:-}" ]]; then
+  printf '%s\n' "pane-focused" >"${warp_dir}/window-pending"
+fi
+
+debug "warped to ${target_x},${target_y}"
+exit 0

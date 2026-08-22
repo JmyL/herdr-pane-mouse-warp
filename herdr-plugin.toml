@@ -1,0 +1,20 @@
+id = "herdr-pane-mouse-warp"
+name = "Herdr Pane Mouse Warp"
+version = "0.3.8"
+min_herdr_version = "0.7.3"
+description = "Warp the Sway pointer into the focused Herdr pane on keyboard pane or window focus."
+platforms = ["linux"]
+
+[[actions]]
+id = "warp"
+title = "Warp pointer into focused pane"
+command = ["./herdr-warp-on-focus"]
+
+[[actions]]
+id = "stamp-bindings"
+title = "Stamp Sway keyboard focus bindings"
+command = ["./herdr-warp-binding-stamp"]
+
+[[events]]
+on = "pane.focused"
+command = ["./herdr-warp-on-focus"]
