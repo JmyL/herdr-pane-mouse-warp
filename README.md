@@ -12,7 +12,8 @@ herdr plugin install JmyL/herdr-pane-mouse-warp --yes
 
 - `pane.focused` event runs `herdr-warp-on-focus`.
 - `warp` action runs the same one-shot warp manually.
-- `stamp-bindings` action starts the Sway binding subscriber used by Kitty focus integration.
+- startup runs the Sway binding subscriber used by Kitty focus integration.
+- `stamp-bindings` action starts the same subscriber manually; a lock prevents duplicate subscribers.
 
 The scripts prefer host tools from `PATH`; when running inside a toolbox/container,
 they can fall back to `flatpak-spawn --host`.
