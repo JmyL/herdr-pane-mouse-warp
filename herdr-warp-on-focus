@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Warp the Sway pointer into the focused Herdr pane (left edge, vertical center)
+# Warp the Sway pointer into the focused Herdr pane (pane center)
 # so the mouse wheel scrolls that pane after keyboard focus moves.
 set -euo pipefail
 
@@ -328,12 +328,10 @@ cell_h = inner_h / lines
 origin_x = wx + pad_x0
 origin_y = wy + pad_y0
 
-# One cell inset from the pane's left edge keeps the pointer inside the
-# pane (and away from split chrome) despite rounding.
-inset_cols = 1.5 if pw > 1 else 0.5
-inset_rows = ph / 2.0
-x = int(origin_x + (px + inset_cols) * cell_w)
-y = int(origin_y + (py + inset_rows) * cell_h)
+# Pane center keeps the pointer well inside the pane (and away from split
+# chrome) despite rounding.
+x = int(origin_x + (px + pw / 2.0) * cell_w)
+y = int(origin_y + (py + ph / 2.0) * cell_h)
 
 # Clamp to the pane's inner pixel box so we never sit on/over the border.
 pane_left = origin_x + px * cell_w

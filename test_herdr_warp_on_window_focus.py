@@ -191,9 +191,9 @@ class CursorNudgeTest(unittest.TestCase):
 
 
 class WarpTargetTest(unittest.TestCase):
-    """End-to-end check that the warp lands on the pane's left edge."""
+    """End-to-end check that the warp lands on the pane center."""
 
-    def test_targets_left_edge_of_focused_pane(self):
+    def test_targets_center_of_focused_pane(self):
         import socket
 
         script = Path(__file__).with_name("herdr-warp-on-focus")
@@ -244,9 +244,8 @@ class WarpTargetTest(unittest.TestCase):
             kitty.chmod(0o755)
 
             # Kitty window at (100, 50), 800x480 px, 80x24 cells -> 10x20 px
-            # cells. Focused pane is the right half (cols 40..79), so its left
-            # edge is 100 + 40*10 = 500 px; the 1.5-col inset lands at 515 and
-            # the vertical center at 290.
+            # cells. Focused pane is the right half (cols 40..79, rows 0..23),
+            # so its center is at (100 + 60*10, 50 + 12*20) = (700, 290).
             tree = (
                 '{"focused": true, "app_id": "kitty", "pid": 999999, '
                 '"rect": {"x": 100, "y": 50, "width": 800, "height": 480}}'
@@ -284,7 +283,7 @@ class WarpTargetTest(unittest.TestCase):
             sock.close()
             self.assertEqual(result.returncode, 0, result.stderr)
             warp_log = log.read_text(encoding="utf-8")
-            self.assertIn("seat seat0 cursor set 514 290", warp_log)
+            self.assertIn("seat seat0 cursor set 699 290", warp_log)
             self.assertIn("seat seat0 cursor move 1 0", warp_log)
 
 
