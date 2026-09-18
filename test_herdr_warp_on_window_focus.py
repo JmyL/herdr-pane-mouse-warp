@@ -190,6 +190,104 @@ class CursorNudgeTest(unittest.TestCase):
         self.assertNotIn("cursor set 0 ", log)
 
 
+class WarpTargetTest(unittest.TestCase):
+    """End-to-end check that the warp lands on the pane's left edge."""
+
+    def test_targets_left_edge_of_focused_pane(self):
+        import socket
+
+        script = Path(__file__).with_name("herdr-warp-on-focus")
+        with tempfile.TemporaryDirectory() as raw:
+            td = Path(raw)
+            bin_dir = td / "bin"
+            bin_dir.mkdir()
+            log = td / "sway.log"
+            kitty_dir = td / "kitty"
+            kitty_dir.mkdir()
+            sock_path = kitty_dir / "kitty.sock"
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(str(sock_path))
+            sock.listen(1)
+
+            sway = bin_dir / "swaymsg"
+            sway.write_text(
+                "#!/bin/sh\n"
+                'case "${1:-}" in\n'
+                "-t)\n"
+                '  case "$2" in\n'
+                '  get_tree) printf \'%s\' "$HERDR_WARP_TEST_TREE_JSON" ;;\n'
+                '  get_outputs) printf \'%s\' "$HERDR_WARP_TEST_OUTPUTS_JSON" ;;\n'
+                "  esac\n"
+                "  ;;\n"
+                "*)\n"
+                '  printf \'%s\\n\' "$*" >>"$HERDR_WARP_TEST_LOG"\n'
+                "  ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            sway.chmod(0o755)
+
+            herdr = bin_dir / "herdr"
+            herdr.write_text(
+                '#!/bin/sh\nprintf \'%s\' "$HERDR_WARP_TEST_LAYOUT_JSON"\n',
+                encoding="utf-8",
+            )
+            herdr.chmod(0o755)
+
+            kitty = bin_dir / "kitty"
+            kitty.write_text(
+                '#!/bin/sh\n'
+                'printf \'[{"tabs": [{"windows": '
+                '[{"is_focused": true, "columns": 80, "lines": 24}]}]}]\'\n',
+                encoding="utf-8",
+            )
+            kitty.chmod(0o755)
+
+            # Kitty window at (100, 50), 800x480 px, 80x24 cells -> 10x20 px
+            # cells. Focused pane is the right half (cols 40..79), so its left
+            # edge is 100 + 40*10 = 500 px; the 1.5-col inset lands at 515 and
+            # the vertical center at 290.
+            tree = (
+                '{"focused": true, "app_id": "kitty", "pid": 999999, '
+                '"rect": {"x": 100, "y": 50, "width": 800, "height": 480}}'
+            )
+            outputs = (
+                '[{"active": true, "rect": {"x": 0, "y": 0, '
+                '"width": 1920, "height": 1080}, "scale": 1.0}]'
+            )
+            layout = (
+                '{"result": {"layout": {"focused_pane_id": 1, "panes": ['
+                '{"pane_id": 1, "focused": true, '
+                '"rect": {"x": 40, "y": 0, "width": 40, "height": 24}}'
+                "]}}}"
+            )
+
+            result = subprocess.run(
+                [str(script)],
+                env={
+                    "HOME": str(td),
+                    "PATH": f"{bin_dir}:/usr/bin:/bin",
+                    "HERDR_WARP_ON_FOCUS": "1",
+                    "HERDR_BIN": str(herdr),
+                    "KITTY_LISTEN_ON": f"unix:{sock_path}",
+                    "KITTY_CONFIG_DIRECTORY": str(kitty_dir),
+                    "HERDR_WARP_DIR": str(td / "warp"),
+                    "HERDR_WARP_TEST_LOG": str(log),
+                    "HERDR_WARP_TEST_TREE_JSON": tree,
+                    "HERDR_WARP_TEST_OUTPUTS_JSON": outputs,
+                    "HERDR_WARP_TEST_LAYOUT_JSON": layout,
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            sock.close()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            warp_log = log.read_text(encoding="utf-8")
+            self.assertIn("seat seat0 cursor set 514 290", warp_log)
+            self.assertIn("seat seat0 cursor move 1 0", warp_log)
+
+
 class OneShotWindowFocusTest(unittest.TestCase):
     def setUp(self):
         self._old_dir = MOD.WARP_DIR
