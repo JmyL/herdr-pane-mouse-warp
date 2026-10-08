@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Warp the Sway pointer into the focused Herdr pane (pane center)
+# Warp the Sway pointer into the focused Herdr pane (pane center; the window
+# center while the tab is zoomed)
 # so the mouse wheel scrolls that pane after keyboard focus moves.
 set -euo pipefail
 
@@ -328,19 +329,39 @@ cell_h = inner_h / lines
 origin_x = wx + pad_x0
 origin_y = wy + pad_y0
 
-# Pane center keeps the pointer well inside the pane (and away from split
-# chrome) despite rounding.
-x = int(origin_x + (px + pw / 2.0) * cell_w)
-y = int(origin_y + (py + ph / 2.0) * cell_h)
-
-# Clamp to the pane's inner pixel box so we never sit on/over the border.
-pane_left = origin_x + px * cell_w
-pane_right = origin_x + (px + pw) * cell_w
-pane_top = origin_y + py * cell_h
-pane_bottom = origin_y + (py + ph) * cell_h
 margin = max(cell_w * 0.25, 1.0)
-x = int(min(max(x, pane_left + margin), pane_right - margin))
-y = int(min(max(y, pane_top + margin), pane_bottom - margin))
+zoomed = bool(layout.get("zoomed"))
+if zoomed:
+  # A zoomed pane covers the whole tab, but the layout still reports the
+  # pane's logical (unzoomed) rect. Aim for the center of the tab area (the
+  # window) instead.
+  area = layout.get("area") or {}
+  try:
+    ax = int(area["x"])
+    ay = int(area["y"])
+    aw = int(area["width"])
+    ah = int(area["height"])
+  except (KeyError, TypeError, ValueError):
+    die("bad-area")
+  if aw <= 0 or ah <= 0:
+    die("bad-area")
+  x = int(origin_x + (ax + aw / 2.0) * cell_w)
+  y = int(origin_y + (ay + ah / 2.0) * cell_h)
+  x = int(min(max(x, origin_x + margin), origin_x + (ax + aw) * cell_w - margin))
+  y = int(min(max(y, origin_y + margin), origin_y + (ay + ah) * cell_h - margin))
+else:
+  # Pane center keeps the pointer well inside the pane (and away from split
+  # chrome) despite rounding.
+  x = int(origin_x + (px + pw / 2.0) * cell_w)
+  y = int(origin_y + (py + ph / 2.0) * cell_h)
+
+  # Clamp to the pane's inner pixel box so we never sit on/over the border.
+  pane_left = origin_x + px * cell_w
+  pane_right = origin_x + (px + pw) * cell_w
+  pane_top = origin_y + py * cell_h
+  pane_bottom = origin_y + (py + ph) * cell_h
+  x = int(min(max(x, pane_left + margin), pane_right - margin))
+  y = int(min(max(y, pane_top + margin), pane_bottom - margin))
 try:
   kitty_pid = int(focused.get("pid") or 0)
 except (TypeError, ValueError):
@@ -376,6 +397,22 @@ if [[ -n "${kitty_pid:-}" && "$kitty_pid" != "0" ]]; then
   printf '%s %s\n%s %s\n' "$target_x" "$target_y" "${win_w:-0}" "${win_h:-0}" >"${warp_dir}/pane-${kitty_pid}"
 fi
 python3 -c 'import time; print(int(time.time() * 1000))' >"${warp_dir}/last-pane-warp"
+# Keep herdr-warp-zoom-subscriber's flip detection in sync with focus warps.
+LAYOUT_JSON="$layout_json" WARP_DIR="$warp_dir" python3 - <<'PY'
+import json
+import os
+
+try:
+  layout = json.loads(os.environ.get("LAYOUT_JSON", ""))["result"]["layout"]
+except Exception:
+  raise SystemExit(0)
+tab = str(layout.get("tab_id") or "")
+if not tab:
+  raise SystemExit(0)
+zoomed = 1 if layout.get("zoomed") else 0
+with open(os.path.join(os.environ["WARP_DIR"], f"zoom-{tab}"), "w", encoding="utf-8") as fh:
+  fh.write(f"{zoomed}\n")
+PY
 # Invalidate an in-flight window-focus compute so it cannot stomp this pane warp.
 if [[ -z "${HERDR_WARP_TOKEN:-}" ]]; then
   printf '%s\n' "pane-focused" >"${warp_dir}/window-pending"

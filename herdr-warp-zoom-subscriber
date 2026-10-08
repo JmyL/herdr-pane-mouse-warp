@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Subscribe to Herdr layout.updated events and warp on zoom in/out.
+
+Herdr validates plugin manifest event hook names at link time and does not
+accept `layout.updated` (unknown event warning, hook never invoked), so this
+long-lived subscriber connects to the Herdr socket API itself and subscribes
+to `layout.updated` directly. On a zoom flip for the active tab it runs
+herdr-warp-on-focus, which re-reads the authoritative layout and warps the
+Sway pointer to the focused pane center (the window center while zoomed).
+
+A per-tab state file records the last observed zoom state so split, resize,
+and other layout changes never trigger a warp. The state is primed from
+`herdr api snapshot` on start and after every reconnect.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERDR = os.environ.get("HERDR_WARP_HERDR") or "herdr"
+RECONNECT_DELAY_S = 2.0
+RECV_TIMEOUT_S = 30.0
+State = tuple[str, bool]
+
+
+def socket_path() -> Path:
+    if os.environ.get("HERDR_WARP_SOCKET"):
+        return Path(os.environ["HERDR_WARP_SOCKET"])
+    if os.environ.get("HERDR_SOCKET_PATH"):
+        return Path(os.environ["HERDR_SOCKET_PATH"])
+    return Path.home() / ".config" / "herdr" / "herdr.sock"
+
+
+def runtime_dir() -> Path:
+    if os.environ.get("HERDR_WARP_DIR"):
+        return Path(os.environ["HERDR_WARP_DIR"])
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        return Path(xdg) / "herdr-warp"
+    return Path(f"/run/user/{os.getuid()}") / "herdr-warp"
+
+
+def state_path(tab_id: str) -> Path:
+    return runtime_dir() / f"zoom-{tab_id}"
+
+
+def warp_script() -> Path:
+    if os.environ.get("HERDR_WARP_ON_FOCUS_BIN"):
+        return Path(os.environ["HERDR_WARP_ON_FOCUS_BIN"])
+    return Path(__file__).resolve().parent / "herdr-warp-on-focus"
+
+
+def lock_path() -> Path:
+    if os.environ.get("HERDR_WARP_ZOOM_LOCK"):
+        return Path(os.environ["HERDR_WARP_ZOOM_LOCK"])
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    root = Path(xdg) if xdg else Path(f"/run/user/{os.getuid()}")
+    return root / "herdr-warp-zoom-subscriber.lock"
+
+
+def enabled() -> bool:
+    return os.environ.get("HERDR_WARP_ON_FOCUS", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def debug(message: str) -> None:
+    if os.environ.get("HERDR_WARP_ZOOM_DEBUG", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        print(f"herdr-warp-zoom-subscriber: {message}", file=sys.stderr)
+
+
+def fix_path() -> None:
+    user_bin = os.environ.get("HERDR_WARP_USER_BIN") or os.path.expanduser("~/.local/bin")
+    if os.path.isdir(user_bin) and user_bin not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = user_bin + os.pathsep + os.environ.get("PATH", "")
+
+
+def decide_zoom_warp(cached: State | None, current: State | None) -> str:
+    """Return "warp", "update", or "skip" for a layout change.
+
+    cached/current are (tab_id, zoomed) pairs, None when unknown.
+    """
+    if current is None:
+        return "skip"
+    if cached is None or cached[0] != current[0]:
+        # First observation or a different tab: only refresh the state.
+        # Tab switches warp through the pane.focused path instead.
+        return "update"
+    if cached[1] != current[1]:
+        return "warp"
+    return "skip"
+
+
+def read_state(tab_id: str) -> State | None:
+    try:
+        raw = state_path(tab_id).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if raw not in ("0", "1"):
+        return None
+    return tab_id, raw == "1"
+
+
+def write_state(state: State) -> None:
+    try:
+        path = state_path(state[0])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{1 if state[1] else 0}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def run_herdr_json(args: list[str]) -> object | None:
+    try:
+        proc = subprocess.run(
+            [HERDR, *args],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return json.loads(proc.stdout)["result"]
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def active_tab_id() -> str | None:
+    result = run_herdr_json(["pane", "layout", "--current"])
+    if not isinstance(result, dict):
+        return None
+    tab = str((result.get("layout") or {}).get("tab_id") or "")
+    return tab or None
+
+
+def prime_states() -> None:
+    """Record the zoomed flag of every tab from the session snapshot."""
+    result = run_herdr_json(["api", "snapshot"])
+    if not isinstance(result, dict):
+        return
+    layouts = (result.get("snapshot") or {}).get("layouts") or []
+    for layout in layouts:
+        if not isinstance(layout, dict):
+            continue
+        tab = str(layout.get("tab_id") or "")
+        if not tab:
+            continue
+        write_state((tab, bool(layout.get("zoomed"))))
+
+
+def run_warp() -> bool:
+    try:
+        proc = subprocess.run([str(warp_script())], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        debug(f"warp script failed: {exc}")
+        return False
+    debug(f"warp script exit={proc.returncode}")
+    return proc.returncode == 0
+
+
+def handle_event(payload: dict) -> None:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return
+    layout = data.get("layout")
+    if not isinstance(layout, dict):
+        return
+    tab = str(layout.get("tab_id") or "")
+    if not tab:
+        return
+    current: State = (tab, bool(layout.get("zoomed")))
+    action = decide_zoom_warp(read_state(tab), current)
+    write_state(current)
+    debug(f"event tab={tab} zoomed={current[1]} -> {action}")
+    if action != "warp":
+        return
+    # A zoom flip on a background tab must not steal the pointer; only warp
+    # when the affected tab is the one the server currently shows.
+    if active_tab_id() != tab:
+        debug("background tab zoom; skip warp")
+        return
+    run_warp()
+
+
+def read_lines(sock: socket.socket) -> None:
+    buf = b""
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            continue
+        if not chunk:
+            debug("socket closed")
+            return
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("event") == "layout_updated":
+                handle_event(payload)
+            elif payload.get("id") is not None and "error" in payload:
+                debug(f"subscribe error: {json.dumps(payload)[:200]}")
+
+
+def subscribe_once() -> None:
+    path = socket_path()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(RECV_TIMEOUT_S)
+    try:
+        sock.connect(str(path))
+        request = {
+            "id": "herdr-warp-zoom-sub",
+            "method": "events.subscribe",
+            "params": {"subscriptions": [{"type": "layout.updated"}]},
+        }
+        sock.sendall((json.dumps(request) + "\n").encode())
+        debug(f"connected to {path}")
+        read_lines(sock)
+    finally:
+        sock.close()
+
+
+def acquire_lock() -> int | None:
+    path = lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def main(argv: list[str] | None = None) -> int:
+    del argv
+    if not enabled():
+        return 0
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        debug("another subscriber holds the lock")
+        return 0
+    fix_path()
+    try:
+        prime_states()
+        while True:
+            try:
+                subscribe_once()
+            except OSError as exc:
+                debug(f"socket error: {exc}")
+            time.sleep(RECONNECT_DELAY_S)
+            prime_states()
+    finally:
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
