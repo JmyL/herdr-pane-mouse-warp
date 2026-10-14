@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Stamp recent mouse-button activity so pane-focus warps can skip clicks.
+
+Herdr's pane.focused event does not say whether focus came from a mouse
+click or from the keyboard, and Sway IPC cannot report the pointer
+position. This watcher reads evdev directly and records the timestamp of
+the last mouse-button press (BTN_LEFT/BTN_RIGHT/BTN_MIDDLE) in the
+herdr-warp runtime dir. herdr-warp-on-focus skips its warp when that
+stamp is fresh: a fresh press means the user just clicked to activate
+the pane, so the pointer already sits where they put it.
+
+A button press always precedes the Herdr focus event it causes, so the
+stamp is written before herdr-warp-on-focus can possibly read it.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import select
+import shutil
+import struct
+import sys
+import time
+from pathlib import Path
+
+EV_KEY = 0x01
+BUTTON_CODES = frozenset({0x110, 0x111, 0x112})  # BTN_LEFT, BTN_RIGHT, BTN_MIDDLE
+BTN_LEFT_BIT = 272  # BTN_LEFT (0x110) index in the key capability bitmap
+EVENT_STRUCT = struct.Struct("=qQHHi")  # struct input_event on 64-bit Linux
+RESCAN_INTERVAL_S = 5
+STAMP_NAME = "last-mouse"
+
+
+def runtime_dir() -> Path:
+    if os.environ.get("HERDR_WARP_DIR"):
+        return Path(os.environ["HERDR_WARP_DIR"])
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        return Path(xdg) / "herdr-warp"
+    return Path(f"/run/user/{os.getuid()}") / "herdr-warp"
+
+
+def lock_path() -> Path:
+    if os.environ.get("HERDR_WARP_MOUSE_WATCHER_LOCK"):
+        return Path(os.environ["HERDR_WARP_MOUSE_WATCHER_LOCK"])
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    root = Path(xdg) if xdg else Path(f"/run/user/{os.getuid()}")
+    return root / "herdr-warp-mouse-watcher.lock"
+
+
+def enabled() -> bool:
+    return os.environ.get("HERDR_WARP_ON_FOCUS", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def debug(message: str) -> None:
+    if os.environ.get("HERDR_WARP_MOUSE_WATCHER_DEBUG", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        print(f"herdr-warp-mouse-watcher: {message}", file=sys.stderr)
+
+
+def has_button_bit(capabilities_key: str) -> bool:
+    # The sysfs bitmap prints unpadded 64-bit words high-to-low, space
+    # separated; folding each word in keeps kernel bit BTN_LEFT (272) at
+    # index 272.
+    bitmap = 0
+    for word in capabilities_key.split():
+        try:
+            bitmap = (bitmap << 64) | int(word, 16)
+        except ValueError:
+            return False
+    return bitmap >> BTN_LEFT_BIT & 1 == 1
+
+
+def pointer_device_paths(sysfs_root: str = "/sys/class/input") -> list[Path]:
+    try:
+        events = sorted(Path(sysfs_root).glob("event*"))
+    except OSError:
+        return []
+    paths = []
+    for entry in events:
+        try:
+            text = (entry / "device" / "capabilities" / "key").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if has_button_bit(text):
+            paths.append(Path("/dev/input") / entry.name)
+    return paths
+
+
+def open_pointer_devices(
+    sysfs_root: str = "/sys/class/input",
+) -> tuple[dict[int, Path], set[Path]]:
+    devices: dict[int, Path] = {}
+    denied: set[Path] = set()
+    for path in pointer_device_paths(sysfs_root):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            debug(f"cannot open {path}: {exc}")
+            denied.add(path)
+            continue
+        devices[fd] = path
+        debug(f"watching {path}")
+    return devices, denied
+
+
+def buffer_has_button_press(data: bytes) -> bool:
+    size = EVENT_STRUCT.size
+    for offset in range(0, len(data) - size + 1, size):
+        _, _, event_type, code, value = EVENT_STRUCT.unpack_from(data, offset)
+        if event_type == EV_KEY and code in BUTTON_CODES and value == 1:
+            return True
+    return False
+
+
+def write_stamp(stamp_dir: Path, now_ms: int | None = None) -> None:
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    stamp_dir.mkdir(parents=True, exist_ok=True)
+    (stamp_dir / STAMP_NAME).write_text(f"{now_ms}\n", encoding="utf-8")
+
+
+def rescan(devices: dict[int, Path], sysfs_root: str = "/sys/class/input") -> None:
+    known = set(devices.values())
+    for path in pointer_device_paths(sysfs_root):
+        if path in known:
+            continue
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            debug(f"cannot open {path}: {exc}")
+            continue
+        devices[fd] = path
+        debug(f"watching {path}")
+
+
+def watch(devices: dict[int, Path], stamp_dir: Path) -> None:
+    ticks = 0
+    while True:
+        readable, _, _ = select.select(list(devices), [], [], 1.0)
+        for fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                data = b""
+            if not data:
+                # Device vanished (KVM switch, suspend, unplug); a rescan
+                # reopens it when it comes back.
+                path = devices.pop(fd)
+                os.close(fd)
+                debug(f"lost {path}")
+                continue
+            if buffer_has_button_press(data):
+                write_stamp(stamp_dir)
+        ticks += 1
+        if ticks >= RESCAN_INTERVAL_S:
+            ticks = 0
+            rescan(devices)
+
+
+def needs_host_reexec(denied: set[Path]) -> bool:
+    if not denied:
+        return False
+    return Path("/run/.containerenv").is_file() and shutil.which("flatpak-spawn") is not None
+
+
+def acquire_lock() -> int | None:
+    path = lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def main(argv: list[str] | None = None) -> int:
+    del argv
+    if not enabled():
+        return 0
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        debug("another watcher holds the lock")
+        return 0
+    try:
+        devices, denied = open_pointer_devices()
+        if not devices:
+            if needs_host_reexec(denied):
+                os.execvp(
+                    "flatpak-spawn",
+                    ["flatpak-spawn", "--host", sys.executable, str(Path(__file__).resolve())],
+                )
+            debug(f"no readable pointer devices ({len(denied)} denied); exiting")
+            return 0
+        watch(devices, runtime_dir())
+        return 0
+    finally:
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

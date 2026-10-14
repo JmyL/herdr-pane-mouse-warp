@@ -11,7 +11,15 @@ herdr plugin install JmyL/herdr-pane-mouse-warp --yes
 ## Behavior
 
 - `pane.focused` event runs `herdr-warp-on-focus`.
-- `warp` action runs the same one-shot warp manually.
+- `warp` action runs the same warp with `--force`: it never suppresses.
+- Mouse-click activation: the `pane.focused` hook fires for clicks too, and
+  Herdr's event does not say what caused the focus. A startup watcher
+  (`herdr-warp-mouse-watcher`) reads evdev directly and stamps the last
+  mouse-button press (BTN_LEFT/RIGHT/MIDDLE) in the warp runtime dir;
+  `herdr-warp-on-focus` skips the warp while that stamp is fresher than
+  `HERDR_WARP_MOUSE_QUIET_MS` (default 250). The button press always
+  precedes the focus event, so the ordering is safe. No stamp means warp,
+  so a watcher that cannot read `/dev/input` degrades to the old behavior.
 - Zoom in/out: a startup subscriber (`herdr-warp-zoom-subscriber`) connects to the Herdr
   socket API, subscribes to `layout.updated`, and runs the same warp when a tab's zoom
   state flips. Zoomed panes target the window center; unzoomed panes target the pane

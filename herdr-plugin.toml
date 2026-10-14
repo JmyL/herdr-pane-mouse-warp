@@ -1,14 +1,14 @@
 id = "herdr-pane-mouse-warp"
 name = "Herdr Pane Mouse Warp"
-version = "0.4.0"
+version = "0.5.0"
 min_herdr_version = "0.7.3"
-description = "Warp the Sway pointer into the focused Herdr pane on keyboard pane or window focus, and on zoom in/out."
+description = "Warp the Sway pointer into the focused Herdr pane on keyboard pane or window focus and on zoom in/out, skipping mouse-click activation."
 platforms = ["linux"]
 
 [[actions]]
 id = "warp"
 title = "Warp pointer into focused pane"
-command = ["./herdr-warp-on-focus"]
+command = ["./herdr-warp-on-focus", "--force"]
 
 [[actions]]
 id = "stamp-bindings"
@@ -20,6 +20,9 @@ command = ["./herdr-warp-binding-stamp"]
 
 [[startup]]
 command = ["./herdr-warp-zoom-subscriber"]
+
+[[startup]]
+command = ["./herdr-warp-mouse-watcher"]
 
 [[events]]
 on = "pane.focused"

@@ -64,6 +64,35 @@ if [[ "${1:-}" == "--cursor-only" ]]; then
   exit 0
 fi
 
+warp_dir="${HERDR_WARP_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/herdr-warp}"
+
+# The pane.focused hook fires for mouse-click activation too, and the Herdr
+# event does not say what caused the focus. A fresh mouse-button stamp from
+# herdr-warp-mouse-watcher means the user just clicked the pane into focus,
+# so the pointer already sits where they put it and the warp is skipped.
+# The `warp` action (alt+space, notification clicks) runs with --force and
+# always warps.
+force=0
+case "${1:-}" in
+--force) force=1 ;;
+esac
+
+if ((force == 0)); then
+  mouse_quiet_ms="${HERDR_WARP_MOUSE_QUIET_MS:-250}"
+  last_mouse_ms=$(cat "${warp_dir}/last-mouse" 2>/dev/null || true)
+  if [[ -n "$last_mouse_ms" ]]; then
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+      now_ms=$(( ${EPOCHREALTIME/./} / 1000 ))
+    else
+      now_ms=$(python3 -c 'import time; print(int(time.time() * 1000))')
+    fi
+    if [[ "$last_mouse_ms" =~ ^[0-9]+$ ]] && ((now_ms - last_mouse_ms >= 0 && now_ms - last_mouse_ms < mouse_quiet_ms)); then
+      debug "recent-mouse (last ${last_mouse_ms}); skip pane-focus warp"
+      exit 0
+    fi
+  fi
+fi
+
 host_socket_exists() {
   local path="$1"
   if [[ -S "$path" ]]; then
@@ -391,7 +420,6 @@ if ! warp_seat_cursor "$target_x" "$target_y"; then
   exit 0
 fi
 
-warp_dir="${HERDR_WARP_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/herdr-warp}"
 mkdir -p "$warp_dir"
 if [[ -n "${kitty_pid:-}" && "$kitty_pid" != "0" ]]; then
   printf '%s %s\n%s %s\n' "$target_x" "$target_y" "${win_w:-0}" "${win_h:-0}" >"${warp_dir}/pane-${kitty_pid}"
